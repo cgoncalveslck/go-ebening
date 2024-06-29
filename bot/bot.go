@@ -21,26 +21,32 @@ import (
 
 var BotToken string
 
-var State BotState
-
 type SoundName string
 type UserID string
 type GuildID string
+type SoundList map[SoundName]*Sound
+type Command string
+type ChannelName string
+type State struct {
+	SoundList SoundList
+	Entrances map[UserID]*Sound
+	Channels  Channels
+}
+
+type Store map[GuildID]State
+
+type Context struct {
+	GuildID GuildID
+	UserID  UserID
+	State   State
+}
 
 // SoundName as key bc that's what we're using for lookup
-type SoundList map[SoundName]*Sound
 
 type Sound struct {
 	MessageID string
 	URL       string
 	Volume    int // dca uses 0-256 for some reason, try mapping it to 0-100 for better UX
-}
-
-type BotState struct {
-	SoundList        map[GuildID]SoundList
-	Entrances        map[UserID]*Sound
-	Channels         Channels
-	VoiceConnections []*discordgo.VoiceConnection
 }
 
 type Channels struct {
@@ -57,9 +63,6 @@ var (
 	stopPlayback  = make(chan bool)
 	playbackMutex sync.Mutex
 )
-
-type Command string
-type ChannelName string
 
 const (
 	SoundsChannel   ChannelName = "sounds"
@@ -84,8 +87,8 @@ func Run() {
 		panic(err)
 	}
 
-	State = BotState{
-		SoundList: make(map[GuildID]SoundList),
+	State = GuildState{
+		SoundList: make(SoundList),
 		Entrances: make(map[UserID]*Sound),
 		Channels: Channels{
 			VoiceChannels: []VoiceChannel{},
@@ -138,6 +141,15 @@ func Run() {
 // 	order .list
 //  when setting an entrance when use already has one, happened that the old one wasn't removed, can't reproduce
 //  on reupload, keep volume and entrances
+//  optimize memory usage (pointers etc)
+
+// BIG REFACTOR NEEDED
+//  https://excalidraw.com/#json=cJufcyaiOy18NM6cQ-u-o,o07HMkjbMa0FxopxXiWB3A
+// 	keep state per Guild (sounds, entrances, volumes, etc)
+//  can/should be abstracted/implicit by assuming x values are certain in lifetime of event (userID, ChannelID, GuildID)
+// 	in practice we should use "State.SoundList" and the underlying value is actually like Store[GuildID].State.SoundList or something
+//	also make functions/methods for managing state like getSound(name), implicitly should already know your id, server and channel
+// 	instead of doing Store[GuildID].State.SoundList[SoundName] for every state access, you get the point
 
 func newMessage(discord *discordgo.Session, userMessage *discordgo.MessageCreate) {
 	if userMessage.Author.Bot {
