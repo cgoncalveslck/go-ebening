@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -89,6 +90,17 @@ const (
 )
 
 func Run() {
+	log.SetFlags(log.LstdFlags | log.Llongfile)
+	lvl := new(slog.LevelVar)
+
+	ss := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level:     lvl,
+		AddSource: true,
+	}))
+	slog.SetDefault(ss)
+
+	lvl.Set(slog.LevelDebug)
+
 	discord, err := discordgo.New("Bot " + BotToken)
 	if err != nil {
 		panic(err)
