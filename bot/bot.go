@@ -22,6 +22,7 @@ import (
 
 var BotToken string
 var store Store
+var storageBackend StorageBackend
 
 type Command string
 
@@ -100,6 +101,12 @@ func Run() {
 	slog.SetDefault(ss)
 
 	lvl.Set(slog.LevelDebug)
+
+	// Initialize storage backend
+	storageBackend = NewStorageBackend()
+	if err := ValidateStorage(storageBackend); err != nil {
+		panic(fmt.Sprintf("Storage validation failed: %v", err))
+	}
 
 	discord, err := discordgo.New("Bot " + BotToken)
 	if err != nil {
@@ -322,10 +329,24 @@ func handleSoundsChannel(ctx *Context) {
 			}
 
 			if strings.Split(attachment.Filename, ".")[1] == "mp3" {
-				ctx.State.SoundList[strings.TrimSuffix(attachment.Filename, ".mp3")] = &Sound{
-					MessageID: ctx.UserMessage.ID,
-					URL:       attachment.URL,
+				soundName := strings.TrimSuffix(attachment.Filename, ".mp3")
+				
+				// Download the file and save using storage backend
+				resp, err := http.Get(attachment.URL)
+				if err != nil {
+					log.Printf("Error downloading sound: %v", err)
+					continue
 				}
+				
+				sound, err := storageBackend.SaveSound(ctx.Session, ctx, soundName, resp.Body)
+				resp.Body.Close()
+				
+				if err != nil {
+					log.Printf("Error saving sound: %v", err)
+					continue
+				}
+				
+				ctx.State.SoundList[soundName] = sound
 			}
 		}
 	} else {
@@ -456,8 +477,8 @@ func handleCommandsChannel(ctx *Context) {
 			return
 		}
 
-		updatedMessage, updatedSound, err := reuploadSound(ctx, sound, searchTerm, newName)
-		if updatedMessage == nil || updatedSound == nil || err != nil {
+		_, updatedSound, err := reuploadSound(ctx, sound, searchTerm, newName)
+		if updatedSound == nil || err != nil {
 			_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error reuploading sound")
 			if err != nil {
 				panic(err)
@@ -465,8 +486,7 @@ func handleCommandsChannel(ctx *Context) {
 			return
 		}
 
-		// this is ugly af, check if there's a better way to do this
-		sound.MessageID = updatedMessage.ID
+		// Update the sound list
 		ctx.State.SoundList[newName] = updatedSound
 		delete(ctx.State.SoundList, searchTerm)
 
@@ -481,30 +501,14 @@ func handleCommandsChannel(ctx *Context) {
 			return
 		}
 
-		soundMessage, err := ctx.Session.ChannelMessage(ctx.SoundsChannelID, sound.MessageID)
+		// Get current metadata
+		currentMetadata, err := storageBackend.GetSoundMetadata(ctx.Session, ctx, sound)
 		if err != nil {
-			_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error getting sound message")
-			if err != nil {
-				panic(err)
-			}
-			return
+			log.Printf("Error getting sound metadata: %v", err)
+			currentMetadata = ""
 		}
 
-		if !soundMessage.Author.Bot {
-			updatedMessage, updatedSound, err := reuploadSound(ctx, sound, searchTerm, "")
-			if updatedMessage == nil || updatedSound == nil || err != nil {
-				_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error reuploading sound")
-				if err != nil {
-					panic(err)
-				}
-				return
-			}
-			soundMessage = updatedMessage
-			// updatedMessage here sometimes doesn't have GuildID??? idk why
-			ctx.State.SoundList[searchTerm] = updatedSound
-			sound = updatedSound
-		}
-
+		// Check if this is already user's entrance
 		userEntrance, ok := ctx.State.Entrances[ctx.UserID]
 		if ok {
 			if userEntrance.MessageID == sound.MessageID {
@@ -512,19 +516,14 @@ func handleCommandsChannel(ctx *Context) {
 				return
 			} else {
 				delete(ctx.State.Entrances, ctx.UserID)
-				oldEntranceMessage, err := ctx.Session.ChannelMessage(ctx.SoundsChannelID, userEntrance.MessageID)
+				
+				// Remove entrance tag from old entrance sound
+				oldMetadata, err := storageBackend.GetSoundMetadata(ctx.Session, ctx, userEntrance)
 				if err != nil {
-					if strings.Contains(err.Error(), "HTTP 404") {
-						delete(ctx.State.Entrances, ctx.UserID)
-					} else {
-						panic(err)
-					}
-				}
-
-				// remove volume from message
-				if oldEntranceMessage != nil && oldEntranceMessage.Content != "" {
+					log.Printf("Error getting old entrance metadata: %v", err)
+				} else {
 					updatedTags := ""
-					messageTags := strings.Split(oldEntranceMessage.Content, ";")
+					messageTags := strings.Split(oldMetadata, ";")
 					for _, tag := range messageTags {
 						if tag == "" {
 							continue
@@ -540,28 +539,24 @@ func handleCommandsChannel(ctx *Context) {
 						}
 					}
 
-					oldEntranceMessage.Content = updatedTags
-					_, err = ctx.Session.ChannelMessageEdit(ctx.SoundsChannelID, oldEntranceMessage.ID, oldEntranceMessage.Content)
-					if err != nil {
-						_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error removing volume from old entrance")
-						if err != nil {
-							panic(err)
-						}
-						return
+					if err := storageBackend.UpdateSoundMetadata(ctx.Session, ctx, userEntrance, updatedTags); err != nil {
+						log.Printf("Error updating old entrance metadata: %v", err)
 					}
 				}
 			}
 		}
 
-		// right now a message tag can look like "e:userID;v:0-100;e:userID;"
-		// where e: says that sound is an entrance to that user and v: is the volume for that sound
-		messageTags := strings.Split(soundMessage.Content, ";")
+		// Check if entrance already exists for another user
+		messageTags := strings.Split(currentMetadata, ";")
 		if len(messageTags) > 0 {
 			for _, tag := range messageTags {
 				if tag == "" {
 					continue
 				}
 				typeValue := strings.Split(tag, ":")
+				if len(typeValue) != 2 {
+					continue
+				}
 				tagType, tagValue := typeValue[0], typeValue[1]
 
 				if tagType == "e" {
@@ -571,13 +566,17 @@ func handleCommandsChannel(ctx *Context) {
 					}
 				}
 			}
-
 		}
 
-		soundMessage.Content += "e:" + ctx.UserID + ";"
-		ctx.Session.ChannelMessageEdit(ctx.SoundsChannelID, soundMessage.ID, soundMessage.Content)
+		// Add entrance tag
+		newMetadata := currentMetadata + "e:" + ctx.UserID + ";"
+		if err := storageBackend.UpdateSoundMetadata(ctx.Session, ctx, sound, newMetadata); err != nil {
+			ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error setting entrance")
+			log.Printf("Error updating metadata: %v", err)
+			return
+		}
+		
 		ctx.State.Entrances[ctx.UserID] = sound
-
 		ctx.Session.ChannelMessageSendReply(ctx.ChannelID, "Entrance set", uMsg.Reference())
 
 	case command == string(Adjustvol):
@@ -589,6 +588,7 @@ func handleCommandsChannel(ctx *Context) {
 			if err != nil {
 				panic(err)
 			}
+			return
 		}
 
 		if volInt < 0 || volInt > 512 {
@@ -602,29 +602,17 @@ func handleCommandsChannel(ctx *Context) {
 			return
 		}
 
-		soundMessage, err := ctx.Session.ChannelMessage(ctx.SoundsChannelID, sound.MessageID)
+		// Get current metadata
+		currentMetadata, err := storageBackend.GetSoundMetadata(ctx.Session, ctx, sound)
 		if err != nil {
-			panic(err)
+			log.Printf("Error getting sound metadata: %v", err)
+			currentMetadata = ""
 		}
 
-		// make function for this
-		if !soundMessage.Author.Bot {
-			updatedMessage, updatedSound, err := reuploadSound(ctx, sound, searchTerm, "")
-			if updatedMessage == nil || updatedSound == nil || err != nil {
-				_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error reuploading sound")
-				if err != nil {
-					panic(err)
-				}
-				return
-			}
-			soundMessage = updatedMessage
-			ctx.State.SoundList[searchTerm] = updatedSound
-			sound = updatedSound
-		}
-
+		// Remove old volume tag if exists
 		updatedTags := ""
-		if soundMessage.Content != "" {
-			messageTags := strings.Split(soundMessage.Content, ";")
+		if currentMetadata != "" {
+			messageTags := strings.Split(currentMetadata, ";")
 			for _, tag := range messageTags {
 				if tag == "" {
 					continue
@@ -641,12 +629,15 @@ func handleCommandsChannel(ctx *Context) {
 			}
 		}
 
+		// Add new volume tag
 		updatedTags += "v:" + volStr + ";"
-		soundMessage.Content = updatedTags
-		_, err = ctx.Session.ChannelMessageEdit(ctx.SoundsChannelID, soundMessage.ID, soundMessage.Content)
-		if err != nil {
-			panic(err)
+		
+		if err := storageBackend.UpdateSoundMetadata(ctx.Session, ctx, sound, updatedTags); err != nil {
+			ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error adjusting volume")
+			log.Printf("Error updating metadata: %v", err)
+			return
 		}
+		
 		ctx.State.SoundList[searchTerm].Volume = int(volInt)
 		ctx.Session.ChannelMessageSendReply(ctx.ChannelID, "Volume adjusted", uMsg.Reference())
 
@@ -695,18 +686,16 @@ func handleZipUpload(ctx *Context, attachment *discordgo.MessageAttachment) {
 				panic(err)
 			}
 
-			filePath := "sounds/" + file.Name
-			fileWriter, err := os.Create(filePath)
+			soundName := strings.TrimSuffix(file.Name, ".mp3")
+			
+			// Save using storage backend
+			sound, err := storageBackend.SaveSound(ctx.Session, ctx, soundName, fileReader)
 			if err != nil {
-				panic(err)
+				log.Printf("Error saving sound from zip: %v", err)
+			} else {
+				ctx.State.SoundList[soundName] = sound
 			}
 
-			_, err = ctx.Session.ChannelFileSend(ctx.ChannelID, file.Name, fileReader)
-			if err != nil {
-				panic(err)
-			}
-
-			fileWriter.Close()
 			fileReader.Close()
 		}
 	}
@@ -722,64 +711,22 @@ func handleZipUpload(ctx *Context, attachment *discordgo.MessageAttachment) {
 // loads sounds and entrances to memory
 func getSoundsRecursive(d *discordgo.Session, guildID string, beforeID string) error {
 	soundsChannelID, err := getSoundsChannelID(d, guildID)
-	if err != err {
-		panic(err)
-	}
-	channelMessages, err := d.ChannelMessages(soundsChannelID, 100, beforeID, "", "")
 	if err != nil {
 		return err
 	}
-
-	for _, channelMessage := range channelMessages {
-		if len(channelMessage.Attachments) > 0 {
-			fileName := channelMessage.Attachments[0].Filename
-			if strings.Split(fileName, ".")[1] != "mp3" {
-				continue
-			}
-			trimmedName := strings.TrimSuffix(fileName, ".mp3")
-
-			sound := &Sound{
-				MessageID: channelMessage.ID,
-				URL:       channelMessage.Attachments[0].URL,
-			}
-
-			if channelMessage.Content != "" {
-				messageTags := strings.Split(channelMessage.Content, ";")
-
-				for _, tag := range messageTags {
-					if tag == "" {
-						continue
-					}
-
-					tag := strings.Split(tag, ":")
-					tagType, tagValue := tag[0], tag[1]
-
-					if tagType == "e" {
-						// tagValue is the user ID
-						store[guildID].Entrances[tagValue] = sound
-					}
-
-					if tagType == "v" {
-						// tagValue is the volume
-						volInt, err := strconv.ParseInt(tagValue, 10, 64)
-						if err != nil {
-							panic(err)
-						}
-						sound.Volume = int(volInt)
-					}
-				}
-			}
-			store[guildID].SoundList[trimmedName] = sound
-		}
+	
+	soundList, entrances, err := storageBackend.LoadSounds(d, guildID, soundsChannelID)
+	if err != nil {
+		return err
 	}
-
-	// if length < 100, this is the last batch and checked all of them
-	if len(channelMessages) < 100 {
-		return nil
-	}
-
-	lastMessageID := channelMessages[len(channelMessages)-1].ID
-	return getSoundsRecursive(d, guildID, lastMessageID)
+	
+	// Update the store with loaded data
+	state := store[guildID]
+	state.SoundList = soundList
+	state.Entrances = entrances
+	store[guildID] = state
+	
+	return nil
 }
 
 func getSoundsChannelID(d *discordgo.Session, guildID string) (string, error) {
@@ -897,60 +844,22 @@ loop:
 }
 
 func reuploadSound(ctx *Context, sound *Sound, searchTerm string, fileName string) (*discordgo.Message, *Sound, error) {
-	req, err := http.Get(sound.URL)
+	newSound, err := reuploadSoundWithStorage(storageBackend, ctx, sound, searchTerm, fileName)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer req.Body.Close()
-
-	oldMessage, err := ctx.Session.ChannelMessage(ctx.SoundsChannelID, sound.MessageID)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if strings.Contains(oldMessage.Content, "e:") {
-		for _, tag := range strings.Split(oldMessage.Content, ";") {
-			if tag == "" {
-				continue
-			}
-
-			typeValue := strings.Split(tag, ":")
-			tagType, tagValue := typeValue[0], typeValue[1]
-
-			if tagType == "e" {
-				ctx.State.Entrances[tagValue] = sound
-			}
+	
+	// For Discord storage, we need to return the message
+	// For volume storage, we return a dummy message since there's no Discord message
+	var message *discordgo.Message
+	if _, ok := storageBackend.(*DiscordStorage); ok {
+		message, err = ctx.Session.ChannelMessage(ctx.SoundsChannelID, newSound.MessageID)
+		if err != nil {
+			log.Printf("Warning: could not get message: %v", err)
 		}
 	}
-
-	if fileName == "" {
-		fileName = searchTerm
-	}
-	soundMessage, err := ctx.Session.ChannelMessageSendComplex(ctx.SoundsChannelID, &discordgo.MessageSend{
-		Content: oldMessage.Content,
-		Files: []*discordgo.File{
-			{
-				Name:   fileName + ".mp3",
-				Reader: req.Body,
-			},
-		},
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-
-	err = ctx.Session.ChannelMessageDelete(ctx.SoundsChannelID, sound.MessageID)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	updatedSound := &Sound{
-		MessageID: soundMessage.ID,
-		URL:       soundMessage.Attachments[0].URL,
-		Volume:    sound.Volume,
-	}
-
-	return soundMessage, updatedSound, nil
+	
+	return message, newSound, nil
 }
 
 func readyHandler(d *discordgo.Session, ready *discordgo.Ready) {

@@ -12,4 +12,8 @@ RUN apt-get update && \
   apt-get install -y ca-certificates ffmpeg && \
   rm -rf /var/lib/apt/lists/*
 COPY --from=builder /run-app /usr/local/bin/
+
+# Create volume directory for Railway volumes support
+RUN mkdir -p /data/sounds
+
 CMD ["run-app"]
